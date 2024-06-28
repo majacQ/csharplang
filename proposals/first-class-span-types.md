@@ -10,12 +10,25 @@ allowing more natural programming with these integral types.
 Since their introduction in C# 7.2, `Span<T>` and `ReadOnlySpan<T>` have worked their way into the language and base class library (BCL) in many key ways. This is great for
 developers, as their introduction improves performance without costing developer safety. However, the language has held these types at arm's length in a few key ways,
 which makes it hard to express the intent of APIs and leads to a significant amount of surface area duplication for new APIs. For example, the BCL has added a number of new
-[tensor primitive APIs](https://github.com/dotnet/runtime/issues/94553) in .NET 9, but these APIs are all offered on `ReadOnlySpan<T>`. Because C# doesn't recognize the
-relationship between `ReadOnlySpan<T>`, `Span<T>`, and `T[]`, it means that any developers looking to use those APIs with anything other than a `ReadOnlySpan<T>` have to explicitly
-convert to a `ReadOnlySpan<T>`. Further, it also means that they don't have IDE tooling guiding them to use these APIs, since nothing will indicate to the IDE that it is valid
-to pass them after conversion. There are also issues with generic inference in these scenarios. In order to provide maximum usability for this style of API, the BCL will have to
+[tensor primitive APIs](https://github.com/dotnet/runtime/issues/94553) in .NET 9, but these APIs are all offered on `ReadOnlySpan<T>`. C# doesn't recognize the
+relationship between `ReadOnlySpan<T>`, `Span<T>`, and `T[]`, so even though there are user-defined conversions between these types,
+they cannot be used for extension method receivers, cannot compose with other user-defined conversions, and don't help with all generic type inference scenarios.
+Users would need to use explicit conversions or type arguments, which means that IDE tooling is not guiding users to use these APIs, since nothing will indicate to the IDE that it is valid
+to pass these types after conversion. In order to provide maximum usability for this style of API, the BCL will have to
 define an entire set of `Span<T>` and `T[]` overloads, which is a lot of duplicate surface area to maintain for no real gain. This proposal seeks to address the problem by
 having the language more directly recognize these types and conversions.
+
+For example, the BCL can add only one overload of any `MemoryExtensions` helper like:
+
+```cs
+public static class MemoryExtensions
+{
+    public static bool StartsWith<T>(this ReadOnlySpan<T> span, T value) where T : IEquatable<T>;
+}
+```
+
+Previously, Span and array overloads would be needed to make the extension method usable on Span/array-typed variables
+because user-defined conversions (which exist between Span/array/ReadOnlySpan) are not considered for extension receivers.
 
 ## Detailed Design
 
@@ -24,7 +37,7 @@ The changes in this proposal will be tied to `LangVersion >= 13`.
 ### Implicit Span Conversions
 
 We add a new type of implicit conversion to the list in [§10.2.1](https://github.com/dotnet/csharpstandard/blob/draft-v8/standard/conversions.md#1021-general), an
-_implicit span conversion_. This conversion is defined as follows:
+_implicit span conversion_. This conversion is a conversion from type and is defined as follows:
 
 ------
 
@@ -37,6 +50,8 @@ An implicit span conversion permits `array_types`, `System.Span<T>`, `System.Rea
 
 ------
 
+Any Span/ReadOnlySpan types are considered applicable for the conversion if they match by their fully-qualified name.
+
 We also add _implicit span conversion_ to the list of standard implicit conversions
 ([§10.4.2](https://github.com/dotnet/csharpstandard/blob/draft-v8/standard/conversions.md#1042-standard-implicit-conversions)). This allows overload resolution to consider
 them when performing argument resolution, as in the previously-linked API proposal.
@@ -48,10 +63,20 @@ The explicit span conversions are the following:
 There is no standard explicit span conversion unlike other *standard explicit conversions* ([§10.4.3][standard-explicit-conversions])
 which always exist given the opposite standard implicit conversion.
 
+#### User defined conversions
+
 User-defined conversions are not considered when converting between
 - any single-dimensional `array_type` and `System.Span<T>`/`System.ReadOnlySpan<T>`,
 - any combination of `System.Span<T>`/`System.ReadOnlySpan<T>`,
 - `string` and `System.ReadOnlySpan<char>`.
+
+The implicit span conversions are exempted from the rule
+that it is not possible to define a user-defined operator between types for which a non-user-defined conversion exists
+([§10.5.2 Permitted user-defined conversions][permitted-udcs]).
+This is needed so BCL can keep defining the existing Span conversion operators even when they switch to C# 13
+(to avoid binary breaking changes and also because these operators are used in codegen of the new standard span conversion).
+
+#### Extension receiver
 
 We also add _implicit span conversion_ to the list of acceptable implicit conversions on the first parameter of an extension method when determining applicability
 ([12.8.9.3](https://github.com/dotnet/csharpstandard/blob/draft-v8/standard/expressions.md#12893-extension-method-invocations)) (change in bold):
@@ -62,6 +87,24 @@ We also add _implicit span conversion_ to the list of acceptable implicit conver
 > - The name of `Mₑ` is *identifier*
 > - `Mₑ` is accessible and applicable when applied to the arguments as a static method as shown above
 > - An implicit identity, reference ~~or boxing~~ **, boxing, or span** conversion exists from *expr* to the type of the first parameter of `Mₑ`.
+>   **Span conversion is not considered when overload resolution is performed for a method group conversion.**
+
+Note that implicit span conversion is not considered for extension receiver in method group conversions
+which makes the following code continue working as opposed to resulting in a compile-time error
+`CS1113: Extension method 'E.M<int>(Span<int>, int)' defined on value type 'Span<int>' cannot be used to create delegates`:
+
+```cs
+using System;
+using System.Collections.Generic;
+Action<int> a = new int[0].M; // binds to M<int>(IEnumerable<int>, int)
+static class E
+{
+    public static void M<T>(this Span<T> s, T x) => Console.Write(1);
+    public static void M<T>(this IEnumerable<T> e, T x) => Console.Write(2);
+}
+```
+
+There's [an open question](#delegate-extension-receiver-break) whether this break should be avoided or not.
 
 #### Variance
 
@@ -131,7 +174,8 @@ The compiler expects to use the following helpers or equivalents to implement th
 | ReadOnlySpan to ReadOnlySpan | `static ReadOnlySpan<T>.CastUp<TDerived>(ReadOnlySpan<TDerived>)` |
 | string to ReadOnlySpan | `static ReadOnlySpan<char> MemoryExtensions.AsSpan(string)` |
 
-#### Overload resolution
+#### Better conversion from expression
+[betterness-rule]: #better-conversion-from-expression
 
 *Better conversion from expression* ([§12.6.4.5][better-conversion-from-expression]) is updated to prefer implicit span conversions.
 This is based on [collection expressions overload resolution changes][ce-or].
@@ -150,6 +194,9 @@ This is based on [collection expressions overload resolution changes][ce-or].
 >     **both or neither of `C₁` and `C₂` are an implicit span conversion**,
 >     and `T₁` is a better conversion target than `T₂`
 > - `E` is a method group, `T₁` is compatible with the single best method from the method group for conversion `C₁`, and `T₂` is not compatible with the single best method from the method group for conversion `C₂`
+
+This rule should ensure that whenever an overload becomes applicable due to the new span conversions,
+any potential ambiguity with another overload is avoided because the newly-applicable overload is preferred.
 
 Without this rule, the following code that successfully compiled in C# 12 would result in an ambiguity error in C# 13
 because of the new standard implicit conversion from array to ReadOnlySpan applicable to an extension method receiver:
@@ -186,8 +233,10 @@ static class C
 > [!WARNING]
 > Because the betterness rule is gated on `LangVersion >= 13`,
 > API authors cannot add such new overloads if they want to keep supporting users on `LangVersion <= 12`.
-> For example, if .NET 9 BCL introduced such overloads, users that upgrade to .NET 9 but stay on lower LangVersion
-> would suddenly get ambiguity errors for existing code.
+> For example, if .NET 9 BCL introduces such overloads, users that upgrade to `net9.0` TFM but stay on lower LangVersion
+> will get ambiguity errors for existing code, unless BCL also applies
+> [the new `OverloadResolutionPriorityAttribute`][overload-resolution-priority].
+> See also [an open question](#unrestricted-betterness-rule) below.
 
 ### Type inference
 
@@ -343,27 +392,6 @@ namespace N2
 }
 ```
 
-#### Extension invocations as delegates
-
-In the following code snippet, `Enumerable.Contains` was chosen previously,
-but `MemoryExtensions.Contains` will be chosen with this feature
-(thanks to the betterness rule, otherwise this would become an ambiguity).
-However, it will result in this error:
-
-```
-error CS1113: Extension method 'MemoryExtensions.Contains<int>(Span<int>, int)' defined on value type 'Span<int>' cannot be used to create delegates
-```
-
-```cs
-using System;
-using System.Collections.Generic;
-using System.Linq;
-
-var a = new[] { 1, 2 };
-var l = new List<int> { 1, 2, 3, 4 };
-l.RemoveAll(a.Contains); // works today, error tomorrow
-```
-
 ## Open questions
 
 ### Delegate signature matching (answered)
@@ -401,12 +429,40 @@ without needing to create wrappers. We don't have precedent in the language for 
 
 We will not allow variance in delegate conversions here. `D1 d1 = M1;` and `D2 d2 = M2;` will not compile. We could reconsider at a later point if use cases are discovered.
 
+### Unrestricted betterness rule
+
+Should we make [the betterness rule][betterness-rule] unconditional on LangVersion?
+That would allow API authors to add new Span APIs where IEnumerable equivalents exist
+without breaking users on older LangVersions and without needing to use the `OverloadResolutionPriorityAttribute`.
+However, that would mean users could get different behavior after updating the toolset (without changing LangVersion or TargetFramework):
+- Compiler could choose different overloads (technically a breaking change, but hopefully those overloads would have equivalent behavior).
+- Other breaks could arise, unknown at this time.
+
+### Delegate extension receiver break
+
+Should we break existing code like the following (real code found in runtime)?
+LDM recently allowed breaks related to new Span overloads (https://github.com/dotnet/csharplang/blob/main/meetings/2024/LDM-2024-06-17.md#params-span-breaks).
+Currently, this speclet has a mitigation for this break in [the extension receiver section](#extension-receiver).
+
+```cs
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+var list = new List<int> { 1, 2, 3, 4 };
+var toRemove = new int[] { 2, 3 };
+list.RemoveAll(toRemove.Contains); // error CS1113: Extension method 'MemoryExtensions.Contains<int>(Span<int>, int)' defined on value type 'Span<int>' cannot be used to create delegates
+```
+
 ## Alternatives
 
 Keep things as they are.
 
 [standard-explicit-conversions]: https://github.com/dotnet/csharpstandard/blob/8c5e008e2fd6057e1bbe802a99f6ce93e5c29f64/standard/conversions.md#1043-standard-explicit-conversions
+[permitted-udcs]: https://github.com/dotnet/csharpstandard/blob/8c5e008e2fd6057e1bbe802a99f6ce93e5c29f64/standard/conversions.md#1052-permitted-user-defined-conversions
 [better-conversion-from-expression]: https://github.com/dotnet/csharpstandard/blob/8c5e008e2fd6057e1bbe802a99f6ce93e5c29f64/standard/expressions.md#12645-better-conversion-from-expression
+[better-conversion-target]: https://github.com/dotnet/csharpstandard/blob/8c5e008e2fd6057e1bbe802a99f6ce93e5c29f64/standard/expressions.md#12647-better-conversion-target
 [is-type-operator]: https://github.com/dotnet/csharpstandard/blob/8c5e008e2fd6057e1bbe802a99f6ce93e5c29f64/standard/expressions.md#1212121-the-is-type-operator
 
 [ce-or]: https://github.com/dotnet/csharplang/blob/566a4812682ccece4ae4483d640a489287fa9c76/proposals/csharp-12.0/collection-expressions.md#overload-resolution
+[overload-resolution-priority]: https://github.com/dotnet/csharplang/blob/566a4812682ccece4ae4483d640a489287fa9c76/proposals/overload-resolution-priority.md

@@ -12,6 +12,24 @@ In these cases by now you always have to create an instance field and write the 
 
 ## Specification changes
 
+### Syntax
+
+```diff
++ field_or_value
++   : 'field'
++   | 'value'
++   ;
+
+primary_no_array_creation_expression
+    : literal
++   | field_or_value
+    | interpolated_string_expression
+    | ...
+    ;
+```
+
+### Properties
+
 [§14.7.1](https://github.com/dotnet/csharpstandard/blob/standard-v6/standard/classes.md#1471-general) *Properties - General*
 
 > A *property_initializer* may only be given for ~~an automatically implemented property, and~~ **a property that has a backing field that will be emitted and the property either does not have a setter, or its setter is auto-implemented. The *property_initializer*** causes the initialization of the underlying field of such properties with the value given by the *expression*.
@@ -155,6 +173,107 @@ public class Point
 3. Definite assignment related questions:
     - https://github.com/dotnet/csharplang/issues/5563
     - https://github.com/dotnet/csharplang/pull/5573#issuecomment-1002110830
+
+### Feature name
+
+Some options for the name of the feature:
+1. semi-auto properties
+1. field access for auto properties [LDM-2023-07-17](https://github.com/dotnet/csharplang/blob/main/meetings/2023/LDM-2023-07-17.md#compiler-check-in)
+1. field-backed properties
+1. field keyword
+
+### `field` in property initializer
+
+Should `field` be a keyword in a property initializer and bind to the backing field?
+
+```csharp
+class MyClass
+{
+    private const int field = -1;
+
+    public object Property { get; } = field; // bind to const (ok) or backing field (error)?
+}
+```
+
+In the example above, binding to the backing field should result in an error: "initializer cannot reference non-static field".
+
+### `field` and `value` in event accessor
+
+Should `value` be a keyword in an event accessor?
+
+```csharp
+class MyClass
+{
+    private EventHandler _e;
+
+    public event EventHandler E
+    {
+        add { _e += value; }
+        remove { _e -= value; }
+    }
+}
+```
+
+**Recommendation**: `value` is a keyword within an event accessor.
+
+Should `field` be a keyword in an event accessor, and should the compiler generate a backing field?
+
+```csharp
+class MyClass
+{
+    public event EventHandler E
+    {
+        add { field += value; }
+        remove { field -= value; }
+    }
+}
+```
+
+**Recommendation**: `field` is *not* a keyword within an event accessor, and no backing field is generated.
+
+### Interaction with partial properties
+
+#### Initializers
+
+When a partial property uses `field`, which parts should be allowed to have an initializer?
+
+```cs
+partial class C
+{
+    public partial int Prop { get; set; } = 1;
+    public partial int Prop { get => field; set => field = value; } = 2;
+}
+```
+
+- It seems clear that an error should occur when both parts have an initializer.
+- We can think of use cases where either the definition or implementation part might want to set the initial value of the `field`.
+- It seems like if we permit the initializer on the definition part, it is effectively forcing the implementer to use `field` in order for the program to be valid. Is that fine?
+- We think it will be common for generators to use `field` whenever a backing field of the same type is needed in the implementation. This is in part because generators often want to enable their users to use `[field: ...]` targeted attributes on the property definition part. Using the `field` keyword saves the generator implementer the trouble of "forwarding" such attributes to some generated field and suppressing the warnings on the property. Those same generators are likely to also want to allow the user to specify an initial value for the field.
+
+**Recommendation**: Permit an initializer on either part of a partial property when the implementation part uses `field`. Report an error if both parts have an initializer.
+
+#### Auto-accessors
+
+As originally designed, partial property implementation must have bodies for all the accessors. However, recent iterations of the `field` keyword feature have included the notion of "auto-accessors". Should partial property implementations be able to use such accessors? If they are used exclusively, it will be indistinguishable from a defining declaration.
+
+```cs
+partial class C
+{
+    public partial int Prop0 { get; set; }
+    public partial int Prop0 { get => field; set => field = value; } // this is equivalent to the two "semi-auto" forms below.
+
+    public partial int Prop1 { get; set; }
+    public partial int Prop1 { get => field; set; } // is this a valid implementation part?
+
+    public partial int Prop2 { get; set; }
+    public partial int Prop2 { get; set => field = value; } // what about this? will there be disagreement about which is the "best" style?
+    
+
+    public partial int Prop3 { get; }
+    public partial int Prop3 { get => field; } // it will only be valid to use at most 1 auto-accessor, when a second accessor is manually implemented.
+```
+
+**Recommendation**: Disallow auto-accessors in partial property implementations, because the limitations around when they would be usable are more confusing to follow than the benefit of allowing them.
 
 ## LDM history:
 - https://github.com/dotnet/csharplang/blob/main/meetings/2021/LDM-2021-03-10.md#field-keyword
