@@ -4,6 +4,7 @@ All schedule items must have a public issue or checked-in proposal that can be l
 
 ## Schedule ASAP
 
+
 ## Schedule when convenient
 
 - [Labeled `break` and `continue` Statements](https://github.com/dotnet/csharplang/blob/c4ec6fb60c2e174b1abb6c019f22bb15b9b13f6c/proposals/labeled-break-continue.md) (CyrusNajmabadi) Finalize specification.
@@ -35,6 +36,7 @@ All schedule items must have a public issue or checked-in proposal that can be l
 
 ### Wed Jul 22, 2026
 
+- [Unsafe evolution: `safe` on non-`extern` members](https://github.com/dotnet/csharplang/blob/main/proposals/unsafe-evolution.md#allow-safe-on-non-extern-members-libraryimport)
 - C# 16 Priorities (Mads)
 
 ## C# Language Design Notes for 2026
